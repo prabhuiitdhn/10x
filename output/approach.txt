@@ -1,0 +1,165 @@
+Perception Assignment — Approach & Algorithm
+=============================================
+Author  : [Your Name]
+Date    : 2026-06-10
+Input   : depth/depth.db3  (ROS2 bag, 7 depth frames, 480×640, 16UC1)
+Outputs : output/results_table.txt  |  output/rotation_axis.txt
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A depth camera captured 7 snapshots of a rotating cuboidal box.
+Each snapshot is a 2D grid of distance values (depth image).
+The goal is to find, for each snapshot:
+  (a) the angle of the visible box face with respect to the camera
+  (b) the visible area of that face in m²
+And globally:
+  (c) the axis the box is rotating about
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — READ THE ROS2 BAG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The data is stored in a ROS2 bag (SQLite3 + CDR serialisation).
+Library used: rosbags
+
+Each message on topic /depth is a sensor_msgs/Image with:
+  - encoding : 16UC1  (one uint16 per pixel, unit = millimetres)
+  - size     : 480 rows × 640 columns
+
+Conversion:
+  depth_metres = pixel_value / 1000.0
+  pixels with value 0 (no-return) are set to NaN and ignored.
+
+Result: 7 numpy arrays of shape (480, 640) in metres.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — BACK-PROJECT TO 3D POINTS (Pin-Hole Camera Model)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A depth image is a 2D picture. To find plane orientations we need
+3D coordinates. Each pixel (u, v) with depth Z is converted to a
+3D point using the pin-hole model:
+
+    X = (u - cx) * Z / fx          ← right direction
+    Y = (v - cy) * Z / fy          ← down direction
+    Z = depth value                 ← forward (optical axis)
+
+Camera intrinsics used (RealSense D435 defaults, 640×480):
+    fx = fy = 381.0 pixels
+    cx = 320.0,  cy = 240.0  (image centre)
+
+Result: a point cloud (N × 3) for each frame.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — FOREGROUND SEGMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The point cloud contains the box AND the background (walls, floor).
+We only want the box.
+
+Method:
+  1. Find the 15th-percentile depth value → this is the approximate
+     distance to the nearest object (the box).
+  2. Keep only points closer than  z_near × 1.8
+     → discards far background, retains the box.
+
+This is a simple but effective distance-threshold segmentation.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — RANSAC PLANE FITTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The foreground still has noise and multiple surfaces (edges, sides).
+RANSAC (Random Sample Consensus) robustly finds the dominant flat face.
+
+Algorithm:
+  Repeat 300 times:
+    1. Randomly pick 3 foreground points
+    2. Compute the plane through them:
+          normal n = cross(p1-p0, p2-p0),  normalised
+          offset d = -n · p0
+    3. Count inliers: points where |n·p + d| < 0.025 m
+    4. If this trial has more inliers than the best so far → save it
+
+  After 300 trials, take the best plane and REFIT it using all its
+  inliers via SVD (Singular Value Decomposition) for higher accuracy.
+  The last row of V^T from SVD gives the most precise normal.
+
+Result: unit normal vector n = [nx, ny, nz] for the dominant face.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — NORMAL ANGLE & VISIBLE AREA (per frame)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Normal Angle
+  The camera looks along the Z-axis: Z_hat = [0, 0, 1].
+  The angle between the face normal and the camera axis is:
+
+      angle = arccos( n · Z_hat )   (in degrees)
+
+  - angle = 0°  means the face is pointing directly at the camera
+  - angle = 90° means the face is edge-on (not visible)
+
+Visible Area
+  Project all inlier points onto a 2D local coordinate system
+  aligned with the face plane (using PCA to find face axes u, v):
+
+      proj_2D = [ p·u,  p·v ]  for each inlier point p
+
+  Compute the Convex Hull of these 2D projections.
+  The area of the convex hull = visible face area in m².
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — AXIS OF ROTATION (PCA on face normals)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Key insight:
+  When a rigid body rotates about a fixed axis, its face normal
+  sweeps out a CIRCLE on the unit sphere.
+  The rotation axis is PERPENDICULAR to the plane of that circle.
+
+Method — PCA on the 7 face normals:
+  1. Stack all 7 unit normals into a 7×3 matrix N
+  2. Compute the 3×3 covariance matrix:  C = (N - mean)^T (N - mean)
+  3. Find the eigenvalues and eigenvectors of C
+  4. The eigenvector with the SMALLEST eigenvalue points in the
+     direction of least variance → this is perpendicular to the
+     circle plane → this IS the rotation axis
+
+Why smallest eigenvalue?
+  The normals vary a lot within the circle (large eigenvalues for
+  those directions) but barely vary along the axis (tiny eigenvalue).
+
+Result: rotation axis unit vector in the camera frame.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESULTS SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Image No.   Time (s)    Normal Angle (°)    Visible Area (m²)
+------------------------------------------------------------
+1           0.000       56.39               1.1486
+2           1.861       10.66               1.9678
+3           3.330       26.53               1.9937
+4           4.063       45.35               1.4369
+5           4.797       22.86               1.4259
+6           7.669       39.34               1.5055
+7           10.672      39.76               0.9323
+
+Rotation axis (camera frame):  [-0.9989,  0.0326,  0.0337]
+
+Interpretation:
+  The axis is almost exactly the camera X-axis (horizontal).
+  This means the box is TILTING (pitching forward/backward)
+  relative to the camera, not spinning left/right.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LIBRARIES USED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  rosbags     — read ROS2 bag and deserialise CDR messages
+  numpy       — array maths, SVD, PCA, back-projection
+  scipy       — ConvexHull for visible area computation
+  matplotlib  — depth frame and segmentation visualisation
